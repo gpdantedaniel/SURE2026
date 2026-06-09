@@ -41,20 +41,21 @@ def create_waypoints(center_pose, radius=0.05):
 
     # Describing a cube for now
 
-    for i in range(4):
-        angle = 2.0 * math.pi * i / 4
-        pose = Pose()
+    for j in range(4):
+        for i in range(64):
+            angle = 2.0 * math.pi * i / 64
+            pose = Pose()
 
-        pose.position.x = center_pose.position.x + radius * math.cos(angle)
-        pose.position.y = center_pose.position.y + radius * math.sin(angle)
-        pose.position.z = center_pose.position.z
+            pose.position.x = center_pose.position.x + radius * math.cos(angle)
+            pose.position.y = center_pose.position.y + radius * math.sin(angle)
+            pose.position.z = center_pose.position.z + radius * j
 
-        pose.orientation.x = 0.0
-        pose.orientation.y = 1.0
-        pose.orientation.z = 0.0
-        pose.orientation.w = 0.0 
+            pose.orientation.x = 0.0
+            pose.orientation.y = 1.0
+            pose.orientation.z = 0.0
+            pose.orientation.w = 0.0 
 
-        waypoints.append(pose)
+            waypoints.append(pose)
 
     """
     for i in range(0, len(waypoints) - 1):
@@ -132,8 +133,8 @@ class HexagonPlanner(Node):
         req.max_step = 0.005
         req.jump_threshold = 0.0
         req.avoid_collisions = True
-        req.max_velocity_scaling_factor = 0.60
-        req.max_acceleration_scaling_factor = 0.60
+        req.max_velocity_scaling_factor = 6.0
+        req.max_acceleration_scaling_factor = 6.0
 
         # Send out the request asynchronously
         self.get_logger().info("Calling cartesian path compute")
