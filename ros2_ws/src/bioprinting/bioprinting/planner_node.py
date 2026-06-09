@@ -1,7 +1,7 @@
 import copy
 import math
+import os
 from scipy.spatial.transform import Rotation
-
 import rclpy
 from tf2_ros import Buffer
 from tf2_ros import TransformListener
@@ -10,26 +10,11 @@ from rclpy.action import ActionClient
 from geometry_msgs.msg import Pose, Quaternion
 from moveit_msgs.srv import GetCartesianPath
 from moveit_msgs.action import ExecuteTrajectory
+from ament_index_python.packages import get_package_share_directory
 
 # The quaternion for the tool pointing down is [0.0, 1.0, 0.0, 0.0] ... apparently
 
-def compute_tool_down_orientation(current_x: float, current_y: float, next_x: float, next_y: float):
-    dx = next_x - current_x
-    dy = next_y - current_y
-    yaw = math.atan2(dy, dx)
-
-    r = Rotation.from_euler('xyz', [math.pi, 0.0, yaw])
-    qx, qy, qz, qw = r.as_quat()
-    q = Quaternion()
-
-    q.x = float(0)
-    q.y = float(1)
-    q.z = float(0)
-    q.w = float(0)
-
-    return q
-
-
+"""
 def create_waypoints(center_pose, radius=0.05):
     start = copy.deepcopy(center_pose)
     start.orientation.x = 0.0
@@ -57,25 +42,74 @@ def create_waypoints(center_pose, radius=0.05):
 
             waypoints.append(pose)
 
-    """
-    for i in range(0, len(waypoints) - 1):
-
-        current_x = waypoints[i].position.x
-        current_y = waypoints[i].position.y
-
-        next_x = waypoints[i + 1].position.x
-        next_y = waypoints[i + 1].position.y
-
-        waypoints[i].orientation = compute_tool_down_orientation(
-            current_x, 
-            current_y, 
-            next_x, 
-            next_y
-        )
-    """
-
     waypoints.append(waypoints[0])
     waypoints.append(center_pose)
+
+    return waypoints
+"""
+
+import copy
+from geometry_msgs.msg import Pose, Quaternion
+
+accepted_codes = ("G0", "G1", "G90", "G91")
+rejected_actuations = ("E", "F")
+
+def clean_gcode_line(l):
+    split_actuations = l.split(" ")
+    cleaned_actuations = list(filter(lambda l: not l.startswith(rejected_actuations), split_actuations))
+    joined_actuations = " ".join(cleaned_actuations)
+    return joined_actuations
+
+
+def generate_waypoints(gcode_lines: list[str], current_pose):
+    # Holds the presently parsed waypoint
+    coords = {"x": 0.0, "y": 0.0, "z": 0.0}
+    waypoints = []
+
+    for line in gcode_lines:
+        for code in line.split(" "):
+            match code[0]:
+                case "X":
+                    coords["x"] = float(code[1:])
+                case "Y":
+                    coords["y"] = float(code[1:])
+                case "Z":
+                    coords["z"] = float(code[1:])
+
+        pose = Pose()
+        pose.position.x = coords["x"]/1000
+        pose.position.y = coords["y"]/1000
+        pose.position.z = coords["z"]/1000
+
+        pose.orientation.x = 0.0
+        pose.orientation.y = 1.0
+        pose.orientation.z = 0.0
+        pose.orientation.w = 0.0
+
+        waypoints.append(pose)
+
+    start_waypoint = copy.deepcopy(waypoints[0])
+
+    for w in waypoints:
+        w.position.x = w.position.x - start_waypoint.position.x
+        w.position.y = w.position.y - start_waypoint.position.y
+        w.position.z = w.position.z - start_waypoint.position.z
+
+    for w in waypoints:
+        w.position.x = w.position.x + current_pose.position.x
+        w.position.y = w.position.y + current_pose.position.y
+        w.position.z = w.position.z + current_pose.position.z
+
+    return waypoints
+
+
+def gcode_to_waypoints(path, current_pose):
+    with open(path, "r") as file:
+        gcode_lines = file.readlines()
+
+    filtered_lines = list(filter(lambda l: l.startswith(accepted_codes), gcode_lines))
+    parsed_lines = list(map(lambda l: clean_gcode_line(l), filtered_lines))
+    waypoints = generate_waypoints(parsed_lines, current_pose)
 
     return waypoints
 
@@ -133,8 +167,8 @@ class HexagonPlanner(Node):
         req.max_step = 0.005
         req.jump_threshold = 0.0
         req.avoid_collisions = True
-        req.max_velocity_scaling_factor = 6.0
-        req.max_acceleration_scaling_factor = 6.0
+        req.max_velocity_scaling_factor = 0.20
+        req.max_acceleration_scaling_factor = 0.20
 
         # Send out the request asynchronously
         self.get_logger().info("Calling cartesian path compute")
@@ -199,8 +233,20 @@ class HexagonPlanner(Node):
         )
 
         self.get_logger().info("Generating waypoints...")
-        waypoints = create_waypoints(current_pose, radius)
+        # waypoints = create_waypoints(current_pose, radius)
         
+        # package_share_dir = get_package_share_directory('bioprinting')
+        # gcode_file_path = os.path.join(package_share_dir, 'gcode', 'box.gcode')
+
+        package_share_dir = get_package_share_directory('bioprinting')
+
+        from pathlib import Path
+
+        print([f.name for f in Path(get_package_share_directory('bioprinting')).iterdir() if f.is_file()])
+        
+        waypoints = gcode_to_waypoints(os.path.join(package_share_dir, "box.gcode"), current_pose)
+
+
         # Just some debugging
         # target = copy.deepcopy(current_pose)
         # target.position.x += 0.10
