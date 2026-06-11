@@ -26,7 +26,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            "planner_node = bioprinting.planner_node:main"
+            "invitro_planner = bioprinting.invitro_planner:main"
         ],
     },
 )

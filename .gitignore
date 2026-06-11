@@ -227,3 +227,5 @@ log/
 # Vscode settings
 .vscode
 .vscode/
+
+assets/
