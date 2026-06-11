@@ -5,34 +5,26 @@ from tf2_ros import Buffer
 from tf2_ros import TransformListener
 from rclpy.node import Node
 from rclpy.action import ActionClient
+from rclpy.parameter import Parameter
 from geometry_msgs.msg import Pose
 from moveit_msgs.srv import GetCartesianPath
 from moveit_msgs.action import ExecuteTrajectory
 from ament_index_python.packages import get_package_share_directory
 
-# The quaternion for the tool pointing down is [0.0, 1.0, 0.0, 0.0] ... apparently
-
-import copy
-from geometry_msgs.msg import Pose, Quaternion
-
+# Useful for filtering and parsing GCODE
 accepted_codes = ("G0", "G1", "G90", "G91")
 rejected_actuations = ("E", "F")
-
-def clean_gcode_line(l):
-    split_actuations = l.split(" ")
-    cleaned_actuations = list(filter(lambda l: not l.startswith(rejected_actuations), split_actuations))
-    joined_actuations = " ".join(cleaned_actuations)
-    return joined_actuations
-
 
 class InVitroPlanner(Node):
     def __init__(self):
         super().__init__("invitro_planner")
-
         # MoveIt names by Yifey Cheng
         self.group_name = "ar_manipulator"
         self.tool_link = "link_6"           
         self.base_frame = "base_link"
+
+        # Declare and configure defaults
+        self.declare_parameter("gcode_file", Parameter.Type.STRING)
 
         # For computing and executing trajectories
         self.cartesian_client = self.create_client(GetCartesianPath, "/compute_cartesian_path")
@@ -48,13 +40,23 @@ class InVitroPlanner(Node):
         self.execute_client.wait_for_server()
         self.get_logger().info("✅ Connected to MoveIt!")
 
-    def generate_waypoints(self, gcode_lines: list[str], current_pose):
+    def generate_waypoints(self, gcode_path: str, current_pose: Pose):
+        """
+        Reads, parses and translates GCODE commands into waypoints
+        suitable for AR4 MK3 execution with MoveIt
+        """
+        with open(gcode_path, "r") as file:
+            gcode_lines = file.readlines()
+
+        # Preprocessing should probably be refined later
+        filtered_lines = list(filter(lambda l: l.startswith(accepted_codes), gcode_lines))
+
         # Holds the sequentially updated position
         coords = {"x": 0.0, "y": 0.0, "z": 0.0}
         waypoints = []
 
-
-        for line in gcode_lines:
+        # Read each GCODE position
+        for line in filtered_lines:
             for code in line.split(" "):
                 match code[0]:
                     case "X":
@@ -71,7 +73,7 @@ class InVitroPlanner(Node):
             pose.position.y = coords["y"]/1000
             pose.position.z = coords["z"]/1000
 
-            # Orient tool_link downwards for now
+            # Orient tool_link downwards
             pose.orientation.x = 0.0
             pose.orientation.y = 1.0
             pose.orientation.z = 0.0
@@ -82,28 +84,18 @@ class InVitroPlanner(Node):
         start_waypoint = copy.deepcopy(waypoints[0])
 
         for w in waypoints:
+            # Normalize subsequent positions with respect to print start
             w.position.x = w.position.x - start_waypoint.position.x
             w.position.y = w.position.y - start_waypoint.position.y
             w.position.z = w.position.z - start_waypoint.position.z
 
-        for w in waypoints:
+            # Normalize with respect to current pose (refactor later)
             w.position.x = w.position.x + current_pose.position.x
             w.position.y = w.position.y + current_pose.position.y
             w.position.z = w.position.z + current_pose.position.z
 
         return waypoints
-
-
-    def gcode_to_waypoints(self, path, current_pose):
-        with open(path, "r") as file:
-            gcode_lines = file.readlines()
-
-        filtered_lines = list(filter(lambda l: l.startswith(accepted_codes), gcode_lines))
-        parsed_lines = list(map(lambda l: clean_gcode_line(l), filtered_lines))
-        waypoints = generate_waypoints(parsed_lines, current_pose)
-
-        return waypoints
-
+        
     def get_current_tcp_pose(self):
         """
         Query tool_link's transform, represents as a Pose and return
@@ -136,7 +128,6 @@ class InVitroPlanner(Node):
         )
 
         return pose
-
 
     def compute_cartesian_path(self, waypoints: list[Pose]):
         """
@@ -205,41 +196,22 @@ class InVitroPlanner(Node):
 
         return result
 
-    def print(self):
+    def execute_print(self):
         """
-        Computes and executes printing trajectory based
-        on GCODE file provided at startup
+        Computes and executes printing trajectory based on GCODE 
+        file gcode_file requested and provided at startup
         """
-
         current_pose = self.get_current_tcp_pose()
-        
 
-
-        self.get_logger().info("Generating waypoints...")
-        # waypoints = create_waypoints(current_pose, radius)
-        
-        # package_share_dir = get_package_share_directory('bioprinting')
-        # gcode_file_path = os.path.join(package_share_dir, 'gcode', 'box.gcode')
+        # Read GCODE lines and parse into waypoints
+        gcode_file = self.get_parameter("gcode_file").value
+        self.get_logger().info(f"Reading {gcode_file}")
 
         package_share_dir = get_package_share_directory('bioprinting')
+        gcode_path = os.path.join(package_share_dir, gcode_file)
 
-        from pathlib import Path
-
-        print([f.name for f in Path(get_package_share_directory('bioprinting')).iterdir() if f.is_file()])
-        
-        waypoints = gcode_to_waypoints(os.path.join(package_share_dir, "box.gcode"), current_pose)
-
-        
-        self.get_logger().info(f"Waypoints generated ({len(waypoints)}):")
-
-        for i, p in enumerate(waypoints):
-            self.get_logger().info(
-                f"WP {i}: "
-                f"x={p.position.x:.4f} "
-                f"y={p.position.y:.4f} "
-                f"z={p.position.z:.4f} "
-            )
-
+        # Should be renamed gcode_to_waypoints
+        waypoints = self.generate_waypoints(gcode_path, current_pose)
         
         self.get_logger().info("Computing trajectory...")
         trajectory = self.compute_cartesian_path(waypoints)
@@ -253,7 +225,7 @@ class InVitroPlanner(Node):
 def main():
     rclpy.init()
     node = InVitroPlanner()
-    node.draw_hexagon()
+    node.execute_print()
     node.destroy_node()
     rclpy.shutdown()
 
