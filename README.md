@@ -33,8 +33,11 @@ Following this, launch the driver and await calibration to finish.
 
 
 ```bash
-ros2 launch annin_ar4_driver driver.launch.py calibrate:=True include_gripper:=False ar_model:=mk3 serial_port:=/dev/ttyACM0
+ros2 launch annin_ar4_driver driver.launch.py calibrate:=False include_gripper:=False ar_model:=mk3 serial_port:=/dev/ttyACM0
 ```
+
+> [!WARNING]
+> If you are setting the AR4 MK3 for the first time or have just flashed firmware onto the robot's Teensy, please set `calibrate:=True` and run the above command **without the printing head mounted**. You may subsequently use the command above with `calibrate:=False` with the printing head mounted.
 
 Once the robot's been calibrated, start up MoveIt:
 
