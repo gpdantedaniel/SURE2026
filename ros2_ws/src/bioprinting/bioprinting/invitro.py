@@ -1,12 +1,15 @@
+import argparse
 import copy
 import os
 import rclpy
+from enum import Enum, auto
 from tf2_ros import Buffer
 from tf2_ros import TransformListener
 from rclpy.node import Node
 from rclpy.action import ActionClient
 from rclpy.parameter import Parameter
-from geometry_msgs.msg import Pose
+from geometry_msgs.msg import Pose, TwistStamped
+from sensor_msgs.msg import JointState
 from moveit_msgs.srv import GetCartesianPath
 from moveit_msgs.action import ExecuteTrajectory
 from ament_index_python.packages import get_package_share_directory
@@ -14,6 +17,11 @@ from ament_index_python.packages import get_package_share_directory
 # Useful for filtering and parsing GCODE
 accepted_codes = ("G0", "G1", "G90", "G91")
 rejected_actuations = ("E", "F")
+
+class State(Enum):
+    IDLE = auto()
+    PROBING = auto()
+    RETRACTING = auto()
 
 class InVitroPlanner(Node):
     def __init__(self):
@@ -24,11 +32,32 @@ class InVitroPlanner(Node):
         self.base_frame = "base_link"
 
         # Declare and configure defaults
-        self.declare_parameter("gcode_file", Parameter.Type.STRING)
+        self.declare_parameter("gcode_file", "")
 
         # For computing and executing trajectories
         self.cartesian_client = self.create_client(GetCartesianPath, "/compute_cartesian_path")
         self.execute_client = ActionClient(self, ExecuteTrajectory, "/execute_trajectory")
+        self.delta_twist_pub= self.create_publisher(TwistStamped, "/servo_node/delta_twist_cmds", 10)
+        self.joint_state_sub = self.create_subscription(JointState, "/joint_states", self.joint_state_callback, 10)
+
+        # State and control loop
+        self.state = State.IDLE
+        self.control_timer = self.create_timer(0.02, self.control_loop)
+
+        # Tracking state
+        self.previous_z = None
+        self.latest_joint_positions = None
+        self.latest_joint_velocities = None
+
+        self.previous_joint_positions = None
+        self.latest_joint_state = None
+
+        # Probing (subject to tuning)
+        self.no_motion_counter = 0
+        self.motion_threshold = 0.00005
+        self.required_stationary_cycles = 10
+        self.contact_pose = None
+        self.retract_target_z = None
 
         # Listen to tool_link's Pose
         self.tf_buffer = Buffer()
@@ -40,7 +69,87 @@ class InVitroPlanner(Node):
         self.execute_client.wait_for_server()
         self.get_logger().info("✅ Connected to MoveIt!")
 
-    def generate_waypoints(self, gcode_path: str, current_pose: Pose):
+    def joint_state_callback(self, msg: JointState):
+        self.latest_joint_positions = list(msg.position)
+        self.latest_joint_velocities = list(msg.velocity)
+        
+    def publish_probe_twist(self, z_velocity):
+        """
+        Commands the end-effector to probe slowly until it
+        senses a collision... or something of the sort
+        """
+        msg = TwistStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = "base_link"
+        msg.twist.linear.z = z_velocity
+        self.delta_twist_pub.publish(msg)
+
+    def contact_detected(self):
+        """
+        Detects contact with a surface by querying
+        the effort exerted by servos
+        """
+
+        if self.latest_joint_state is None:
+            return False
+        
+        current_positions = list(self.latest_joint_state.position)
+
+        if self.previous_joint_positions is None:
+            self.previous_joint_positions = current_positions
+            return False
+
+        max_motion = max(
+            abs(curr - prev) for curr, prev in
+            zip(current_positions, self.previous_joint_positions)
+        )
+
+        self.previous_joint_positions = current_positions
+
+        if max_motion < self.motion_threshold:
+            print("Adding to the counter!!")
+            self.no_motion_counter += 1
+        else:
+            self.no_motion_counter = 0
+
+        return self.no_motion_counter >= self.required_stationary_cycles
+
+    def control_loop(self):
+        """
+        Controls the robot arm as a state machine...
+        Will be scaled and further developed...
+        """
+        match self.state:
+            case State.IDLE:
+                pass
+            case State.PROBING:
+                if self.contact_detected():
+
+                    print("Contact was detected!")
+                    
+                   
+                    self.no_motion_counter = 0
+                    self.state = State.RETRACTING
+                    return
+
+                print("probing...")
+                self.publish_probe_twist(-0.01)
+                
+            case State.RETRACTING:
+                # current_z = self.get_current_tcp_pose().position.z
+                # Simply retract for now
+
+                """
+                if current_z >= self.retract_target_z:
+                    print("Finished retracting... publishing zero twist")
+                    self.publish_probe_twist(0.0)
+                    self.state = State.IDLE
+                    return
+                """
+
+                self.publish_probe_twist(0.01)
+
+    def gcode_to_waypoints(self, gcode_path: str, current_pose: Pose):
         """
         Reads, parses and translates GCODE commands into waypoints
         suitable for AR4 MK3 execution with MoveIt
@@ -50,6 +159,8 @@ class InVitroPlanner(Node):
 
         # Preprocessing should probably be refined later
         filtered_lines = list(filter(lambda l: l.startswith(accepted_codes), gcode_lines))
+        # More deterministic filtering algorithm required - specific to Prusa Slicer
+        filtered_lines = filtered_lines[14:-2]
 
         # Holds the sequentially updated position
         coords = {"x": 0.0, "y": 0.0, "z": 0.0}
@@ -143,8 +254,8 @@ class InVitroPlanner(Node):
         req.max_step = 0.005
         req.jump_threshold = 0.0
         req.avoid_collisions = True
-        req.max_velocity_scaling_factor = 10.0
-        req.max_acceleration_scaling_factor = 10.0
+        req.max_velocity_scaling_factor = 1.0
+        req.max_acceleration_scaling_factor = 1.0
 
         # Send out the request asynchronously
         self.get_logger().info("Calling cartesian path compute")
@@ -157,11 +268,13 @@ class InVitroPlanner(Node):
         self.get_logger().info("Response received")
         result = future.result()
 
+        path_fraction = result.fraction
+        self.get_logger().info(f"Path fraction: {path_fraction:.3f}")
+
         if result is None:
             raise RuntimeError("Cartesian planning call failed.")
-        else:
-            # A path fraction < 1.00 is problematic... handling required
-            self.get_logger().info(f"Path fraction: {result.fraction:.3f}")
+        if path_fraction < 1.00:
+            raise RuntimeError("Unable to execute path. Please reposition robot.")
 
         return result.solution
     
@@ -195,6 +308,33 @@ class InVitroPlanner(Node):
         self.get_logger().info("Trajectory execution finished.")
 
         return result
+    
+    def orient(self):
+        """
+        Orients the end-effector downwards wherever it stands.
+        Should account for end-effector length.
+        """
+        current_pose = self.get_current_tcp_pose()
+        downards_pose = Pose()
+
+        # Keep the end-effector at the same XYZ point
+        downards_pose.position.x = current_pose.position.x
+        downards_pose.position.y = current_pose.position.y
+        downards_pose.position.z = current_pose.position.z
+
+        # Point end-effector down
+        downards_pose.orientation.x = 0.0
+        downards_pose.orientation.y = 1.0
+        downards_pose.orientation.z = 0.0
+        downards_pose.orientation.w = 0.0
+
+        self.get_logger().info("Computing trajectory...")
+        trajectory = self.compute_cartesian_path([downards_pose])
+        self.get_logger().info("Trajectory computed.")
+
+        self.get_logger().info("Executing trajectory...")
+        self.execute_trajectory(trajectory)
+        self.get_logger().info("Trajectory complete.")
 
     def execute_print(self):
         """
@@ -211,7 +351,7 @@ class InVitroPlanner(Node):
         gcode_path = os.path.join(package_share_dir, gcode_file)
 
         # Should be renamed gcode_to_waypoints
-        waypoints = self.generate_waypoints(gcode_path, current_pose)
+        waypoints = self.gcode_to_waypoints(gcode_path, current_pose)
         
         self.get_logger().info("Computing trajectory...")
         trajectory = self.compute_cartesian_path(waypoints)
@@ -223,10 +363,25 @@ class InVitroPlanner(Node):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("command", choices=["spin", "execute_print", "orient"])
+    args = parser.parse_args()
+
     rclpy.init()
     node = InVitroPlanner()
-    node.execute_print()
-    node.destroy_node()
+
+    match args.command:
+        case "spin":
+            node.state = State.PROBING
+            rclpy.spin(node)
+        case "execute_print":
+            node.execute_print()
+            node.destroy_node()
+        case "orient":
+            node.orient()
+            node.destroy_node()
+
+
     rclpy.shutdown()
 
 if __name__ == '__main__':

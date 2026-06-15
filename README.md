@@ -33,16 +33,22 @@ Following this, launch the driver and await calibration to finish.
 
 
 ```bash
-ros2 launch annin_ar4_driver driver.launch.py calibrate:=False include_gripper:=False ar_model:=mk3 serial_port:=/dev/ttyACM0
+ros2 launch annin_ar4_driver driver.launch.py calibrate:=True include_gripper:=False ar_model:=mk3 serial_port:=/dev/ttyACM0
 ```
 
 > [!WARNING]
 > If you are setting the AR4 MK3 for the first time or have just flashed firmware onto the robot's Teensy, please set `calibrate:=True` and run the above command **without the printing head mounted**. You may subsequently use the command above with `calibrate:=False` with the printing head mounted.
 
+> [!WARNING]
+> More so for myself... MAKE SURE TO INSTALL MOVEIT_SERVO PACKAGE! IT WILL PROBABLY BE NECESSARY FOR PROBING...
+
+>[!WARNING]
+> Also, once you have moveit_servo running, make it do this thing: ros2 service call /servo_node/switch_command_type moveit_msgs/srv/ServoCommandType "{command_type: 1}"
+
 Once the robot's been calibrated, start up MoveIt:
 
 ```bash
-ros2 launch annin_ar4_moveit_config moveit.launch.py ar_model:=mk3 include_gripper:=False
+ros2 launch annin_ar4_moveit_config moveit.launch.py ar_model:=mk3 include_gripper:=False moveit_servo:=True
 ```
 
 Then, in a new terminal window, `cd` into our project's `ros2_ws` and activate the workspace as your **overlay**.
