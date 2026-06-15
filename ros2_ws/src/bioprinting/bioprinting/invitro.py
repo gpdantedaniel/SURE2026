@@ -72,6 +72,7 @@ class InVitroPlanner(Node):
     def joint_state_callback(self, msg: JointState):
         self.latest_joint_positions = list(msg.position)
         self.latest_joint_velocities = list(msg.velocity)
+        self.latest_joint_state = msg
         
     def publish_probe_twist(self, z_velocity):
         """
