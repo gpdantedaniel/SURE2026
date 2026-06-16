@@ -2,6 +2,7 @@ import argparse
 import copy
 import os
 import rclpy
+import serial
 from enum import Enum, auto
 from tf2_ros import Buffer
 from tf2_ros import TransformListener
@@ -18,9 +19,19 @@ from ament_index_python.packages import get_package_share_directory
 accepted_codes = ("G0", "G1", "G90", "G91")
 rejected_actuations = ("E", "F")
 
+nano_serial = serial.Serial(
+    port="/dev/ttyUSB0",
+    baudrate=115200,
+    timeout=1.0
+)
+
 class State(Enum):
     IDLE = auto()
-    PROBING = auto()
+    WAITING = auto()
+    PATH_READY = auto()
+    PROBING_P1 = auto()
+    PROBING_P2 = auto()
+    PROBING_P3 = auto()
     RETRACTING = auto()
 
 class InVitroPlanner(Node):
@@ -42,7 +53,7 @@ class InVitroPlanner(Node):
 
         # State and control loop
         self.state = State.IDLE
-        self.control_timer = self.create_timer(0.02, self.control_loop)
+        self.control_timer = self.create_timer(0.01, self.control_loop)
 
         # Tracking state
         self.previous_z = None
@@ -55,9 +66,14 @@ class InVitroPlanner(Node):
         # Probing (subject to tuning)
         self.no_motion_counter = 0
         self.motion_threshold = 0.00005
-        self.required_stationary_cycles = 10
+        self.required_stationary_cycles = 1
         self.contact_pose = None
         self.retract_target_z = None
+
+        # Poses to construct printing plane
+        self.p1_pose = None
+        self.p2_pose = None
+        self.p3_pose = None
 
         # Listen to tool_link's Pose
         self.tf_buffer = Buffer()
@@ -87,28 +103,15 @@ class InVitroPlanner(Node):
 
     def contact_detected(self):
         """
-        Detects contact with a surface by querying
-        the effort exerted by servos
+        Detects contact with a surface by reading the
+        contact state read by the Arduino Nano
+        and the poor man's limit switch
         """
 
-        if self.latest_joint_state is None:
-            return False
-        
-        current_positions = list(self.latest_joint_state.position)
+        # Read whatever the Arduino Nano is saying
+        line = nano_serial.readline().decode("utf-8").strip()
 
-        if self.previous_joint_positions is None:
-            self.previous_joint_positions = current_positions
-            return False
-
-        max_motion = max(
-            abs(curr - prev) for curr, prev in
-            zip(current_positions, self.previous_joint_positions)
-        )
-
-        self.previous_joint_positions = current_positions
-
-        if max_motion < self.motion_threshold:
-            print("Adding to the counter!!")
+        if line == "PRESSED":
             self.no_motion_counter += 1
         else:
             self.no_motion_counter = 0
@@ -123,32 +126,45 @@ class InVitroPlanner(Node):
         match self.state:
             case State.IDLE:
                 pass
-            case State.PROBING:
+            case State.PROBING_P1:
                 if self.contact_detected():
 
-                    print("Contact was detected!")
+                    self.publish_probe_twist(0.00)
+
+                    self.p1_pose = self.get_current_tcp_pose()
+
+                    # Move above next point(say 3 cm away and 1 cm above)
+                    next_point = copy.copy(self.p1_pose)
+                    next_point.position.y = next_point.position.y + 0.030
+                    next_point.position.z = next_point.position.z + 0.010
+                    waypoints = [next_point]
+
+                    def callback(future):
+                        response = future.result()
+                        print(response)
+                        # planned_trajectory = future.solution
+                        print("planned_trajectory obtained!")
+                        self.State = State.PATH_READY
+
+                    self.compute_cartesian_path(waypoints, callback=callback)
                     
-                   
+                    self.state = State.WAITING
+
                     self.no_motion_counter = 0
                     self.state = State.RETRACTING
                     return
 
-                print("probing...")
                 self.publish_probe_twist(-0.01)
-                
+
+            case State.PATH_READY:
+                print("Resuming execution")
+
+                self.state = State.RETRACTING
+
             case State.RETRACTING:
-                # current_z = self.get_current_tcp_pose().position.z
-                # Simply retract for now
-
-                """
-                if current_z >= self.retract_target_z:
-                    print("Finished retracting... publishing zero twist")
-                    self.publish_probe_twist(0.0)
-                    self.state = State.IDLE
-                    return
-                """
-
                 self.publish_probe_twist(0.01)
+
+
 
     def gcode_to_waypoints(self, gcode_path: str, current_pose: Pose):
         """
@@ -241,7 +257,7 @@ class InVitroPlanner(Node):
 
         return pose
 
-    def compute_cartesian_path(self, waypoints: list[Pose]):
+    def compute_cartesian_path(self, waypoints: list[Pose], callback: None):
         """
         Build and send request to /compute_cartesian_path 
         service and return computed trajectory
@@ -262,24 +278,29 @@ class InVitroPlanner(Node):
         self.get_logger().info("Calling cartesian path compute")
         future = self.cartesian_client.call_async(req)
 
-        # Get the service to spin and read result
-        self.get_logger().info("Waiting for response")
-        rclpy.spin_until_future_complete(self, future)
-        
-        self.get_logger().info("Response received")
-        result = future.result()
+        # Should be refined afterwards
+        if callback:
+            future.add_done_callback(callback)
+        else:
+            # Get the service to spin and read result
+            self.get_logger().info("Waiting for response")
+            rclpy.spin_until_future_complete(self, future)
 
-        path_fraction = result.fraction
-        self.get_logger().info(f"Path fraction: {path_fraction:.3f}")
+            
+            self.get_logger().info("Response received")
+            result = future.result()
 
-        if result is None:
-            raise RuntimeError("Cartesian planning call failed.")
-        if path_fraction < 1.00:
-            raise RuntimeError("Unable to execute path. Please reposition robot.")
+            path_fraction = result.fraction
+            self.get_logger().info(f"Path fraction: {path_fraction:.3f}")
 
-        return result.solution
+            if result is None:
+                raise RuntimeError("Cartesian planning call failed.")
+            if path_fraction < 1.00:
+                raise RuntimeError("Unable to execute path. Please reposition robot.")
+
+            return result.solution
     
-    def execute_trajectory(self, trajectory: ExecuteTrajectory):
+    def execute_trajectory(self, trajectory: ExecuteTrajectory, callback: None):
         """
         Send out trajectory goal and reports
         acceptance and execution statuses
@@ -307,6 +328,9 @@ class InVitroPlanner(Node):
 
         result = result_future.result()
         self.get_logger().info("Trajectory execution finished.")
+
+        # Self-explanatory I suppose
+        if callback: callback()
 
         return result
     
@@ -365,15 +389,15 @@ class InVitroPlanner(Node):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=["spin", "execute_print", "orient"])
+    parser.add_argument("command", choices=["probe", "execute_print", "orient"])
     args = parser.parse_args()
 
     rclpy.init()
     node = InVitroPlanner()
 
     match args.command:
-        case "spin":
-            node.state = State.PROBING
+        case "probe":
+            node.state = State.PROBING_P1
             rclpy.spin(node)
         case "execute_print":
             node.execute_print()
@@ -382,7 +406,7 @@ def main():
             node.orient()
             node.destroy_node()
 
-
+    nano_serial.close()
     rclpy.shutdown()
 
 if __name__ == '__main__':
