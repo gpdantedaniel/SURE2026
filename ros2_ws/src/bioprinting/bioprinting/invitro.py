@@ -27,12 +27,15 @@ nano_serial = serial.Serial(
 
 class State(Enum):
     IDLE = auto()
-    WAITING = auto()
-    PATH_READY = auto()
+
     PROBING_P1 = auto()
     PROBING_P2 = auto()
     PROBING_P3 = auto()
-    RETRACTING = auto()
+
+    CALCULATING_PATH = auto()
+    PATH_READY = auto()
+    EXECUTING_TRAJECTORY = auto()
+    EXECUTION_COMPLETE = auto()
 
 class InVitroPlanner(Node):
     def __init__(self):
@@ -42,38 +45,29 @@ class InVitroPlanner(Node):
         self.tool_link = "link_6"           
         self.base_frame = "base_link"
 
-        # Declare and configure defaults
+        # Declare parameters and defaults
         self.declare_parameter("gcode_file", "")
 
         # For computing and executing trajectories
         self.cartesian_client = self.create_client(GetCartesianPath, "/compute_cartesian_path")
         self.execute_client = ActionClient(self, ExecuteTrajectory, "/execute_trajectory")
         self.delta_twist_pub= self.create_publisher(TwistStamped, "/servo_node/delta_twist_cmds", 10)
-        self.joint_state_sub = self.create_subscription(JointState, "/joint_states", self.joint_state_callback, 10)
 
         # State and control loop
-        self.state = State.IDLE
         self.control_timer = self.create_timer(0.01, self.control_loop)
-
-        # Tracking state
-        self.previous_z = None
-        self.latest_joint_positions = None
-        self.latest_joint_velocities = None
-
-        self.previous_joint_positions = None
-        self.latest_joint_state = None
+        self.state = State.IDLE
 
         # Probing (subject to tuning)
         self.no_motion_counter = 0
-        self.motion_threshold = 0.00005
         self.required_stationary_cycles = 1
-        self.contact_pose = None
-        self.retract_target_z = None
 
-        # Poses to construct printing plane
+        # Printing surface points
         self.p1_pose = None
         self.p2_pose = None
         self.p3_pose = None
+
+        # Hold trajectories
+        self.trajectory = None
 
         # Listen to tool_link's Pose
         self.tf_buffer = Buffer()
@@ -84,11 +78,6 @@ class InVitroPlanner(Node):
         self.cartesian_client.wait_for_service()
         self.execute_client.wait_for_server()
         self.get_logger().info("✅ Connected to MoveIt!")
-
-    def joint_state_callback(self, msg: JointState):
-        self.latest_joint_positions = list(msg.position)
-        self.latest_joint_velocities = list(msg.velocity)
-        self.latest_joint_state = msg
         
     def publish_probe_twist(self, z_velocity):
         """
@@ -128,42 +117,43 @@ class InVitroPlanner(Node):
                 pass
             case State.PROBING_P1:
                 if self.contact_detected():
-
                     self.publish_probe_twist(0.00)
-
                     self.p1_pose = self.get_current_tcp_pose()
 
-                    # Move above next point(say 3 cm away and 1 cm above)
                     next_point = copy.copy(self.p1_pose)
-                    next_point.position.y = next_point.position.y + 0.030
+                    # next_point.position.y = next_point.position.y + 0.030
                     next_point.position.z = next_point.position.z + 0.010
-                    waypoints = [next_point]
 
                     def callback(future):
-                        response = future.result()
-                        print(response)
-                        # planned_trajectory = future.solution
-                        print("planned_trajectory obtained!")
-                        self.State = State.PATH_READY
+                        trajectory = future.result().solution
+                        print("trajectory here: ", trajectory)
 
-                    self.compute_cartesian_path(waypoints, callback=callback)
-                    
-                    self.state = State.WAITING
+                        def execution_callback(*args):
+                            self.state = State.PROBING_P2
 
+                        self.execute_trajectory(trajectory, callback=execution_callback)
+
+                        self.state = State.EXECUTING_TRAJECTORY
+                        print("Trajectory obtained! Executing...")
+
+                    self.compute_cartesian_path([next_point], callback=callback)
+                    self.state = State.CALCULATING_PATH
                     self.no_motion_counter = 0
-                    self.state = State.RETRACTING
                     return
 
                 self.publish_probe_twist(-0.01)
 
-            case State.PATH_READY:
-                print("Resuming execution")
+            case State.CALCULATING_PATH:
+                print("Awaiting path...")
+                pass
 
-                self.state = State.RETRACTING
+            case State.EXECUTING_TRAJECTORY:
+                print("Executing...")
+                pass
 
-            case State.RETRACTING:
-                self.publish_probe_twist(0.01)
-
+            case State.PROBING_P2:
+                print("now probing P2...")
+                pass
 
 
     def gcode_to_waypoints(self, gcode_path: str, current_pose: Pose):
@@ -257,7 +247,7 @@ class InVitroPlanner(Node):
 
         return pose
 
-    def compute_cartesian_path(self, waypoints: list[Pose], callback: None):
+    def compute_cartesian_path(self, waypoints: list[Pose], callback=None):
         """
         Build and send request to /compute_cartesian_path 
         service and return computed trajectory
@@ -300,7 +290,7 @@ class InVitroPlanner(Node):
 
             return result.solution
     
-    def execute_trajectory(self, trajectory: ExecuteTrajectory, callback: None):
+    def execute_trajectory(self, trajectory: ExecuteTrajectory, callback=None):
         """
         Send out trajectory goal and reports
         acceptance and execution statuses
@@ -312,27 +302,28 @@ class InVitroPlanner(Node):
         self.get_logger().info("Sending out trajectory...")
         send_goal_future = self.execute_client.send_goal_async(goal)
 
-        rclpy.spin_until_future_complete(self, send_goal_future)
-        self.get_logger().info("Waiting for execution acceptance...")
+        if callback:
+            send_goal_future.add_done_callback(callback)
 
-        goal_handle = send_goal_future.result()
-
-        if not goal_handle.accepted:
-            raise RuntimeError("Trajectory execution rejected.")
         else:
-            self.get_logger().info("Trajectory accepted.")
+            rclpy.spin_until_future_complete(self, send_goal_future)
+            self.get_logger().info("Waiting for execution acceptance...")
 
-        self.get_logger().info("Executing trajectory...")
-        result_future = goal_handle.get_result_async()
-        rclpy.spin_until_future_complete(self, result_future)
+            goal_handle = send_goal_future.result()
 
-        result = result_future.result()
-        self.get_logger().info("Trajectory execution finished.")
+            if not goal_handle.accepted:
+                raise RuntimeError("Trajectory execution rejected.")
+            else:
+                self.get_logger().info("Trajectory accepted.")
 
-        # Self-explanatory I suppose
-        if callback: callback()
+            self.get_logger().info("Executing trajectory...")
+            result_future = goal_handle.get_result_async()
+            rclpy.spin_until_future_complete(self, result_future)
 
-        return result
+            result = result_future.result()
+            self.get_logger().info("Trajectory execution finished.")
+
+            return result
     
     def orient(self):
         """
