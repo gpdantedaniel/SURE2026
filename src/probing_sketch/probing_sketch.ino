@@ -1,4 +1,5 @@
 const int buttonPin = 2;
+int lastState = HIGH;
 
 void setup() {
   pinMode(buttonPin, INPUT_PULLUP);
@@ -7,6 +8,15 @@ void setup() {
 
 void loop() {
   bool state = digitalRead(buttonPin);
-  Serial.println(state == LOW ? "PRESSED" : "RELEASED");
-  delay(10);
+
+  if (lastState != state) {
+    if (state == LOW) {
+      Serial.println("PRESSED");
+    } else {
+      Serial.println("RELEASED");
+    };
+    delay(10);
+  }
+
+  lastState = state;
 }

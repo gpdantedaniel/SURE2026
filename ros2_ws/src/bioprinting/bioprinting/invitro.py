@@ -1,12 +1,15 @@
 import argparse
 import copy
 import os
+import time
 import rclpy
 import serial
+import asyncio
 from enum import Enum, auto
 from tf2_ros import Buffer
 from tf2_ros import TransformListener
 from rclpy.node import Node
+from rclpy.task import Future
 from rclpy.action import ActionClient
 from rclpy.parameter import Parameter
 from geometry_msgs.msg import Pose, TwistStamped
@@ -25,17 +28,9 @@ nano_serial = serial.Serial(
     timeout=1.0
 )
 
-class State(Enum):
+class ProbingState(Enum):
     IDLE = auto()
-
-    PROBING_P1 = auto()
-    PROBING_P2 = auto()
-    PROBING_P3 = auto()
-
-    CALCULATING_PATH = auto()
-    PATH_READY = auto()
-    EXECUTING_TRAJECTORY = auto()
-    EXECUTION_COMPLETE = auto()
+    PROBING = auto()
 
 class InVitroPlanner(Node):
     def __init__(self):
@@ -53,11 +48,14 @@ class InVitroPlanner(Node):
         self.execute_client = ActionClient(self, ExecuteTrajectory, "/execute_trajectory")
         self.delta_twist_pub= self.create_publisher(TwistStamped, "/servo_node/delta_twist_cmds", 10)
 
-        # State and control loop
-        self.control_timer = self.create_timer(0.01, self.control_loop)
-        self.state = State.IDLE
+        # Old control loop for calibration
+        self.probing_timer = self.create_timer(0.001, self.probing_loop)
+        self.contact_timer = self.create_timer(0.01, self.detect_contact)
+        self.probing_state = ProbingState.IDLE
+        self.probe_future = None
 
         # Probing (subject to tuning)
+        self.contact = 0
         self.no_motion_counter = 0
         self.required_stationary_cycles = 1
 
@@ -78,7 +76,99 @@ class InVitroPlanner(Node):
         self.cartesian_client.wait_for_service()
         self.execute_client.wait_for_server()
         self.get_logger().info("✅ Connected to MoveIt!")
+
+    def probing_loop(self):
+
+        match self.probing_state:
+            case ProbingState.PROBING:
+                
+                if self.contact:
+                    print("Contact!")
+                    self.probing_state = ProbingState.IDLE
+                    current_pose = self.get_current_tcp_pose()
+                    self.publish_probe_twist(0.00)
+                    self.no_motion_counter = 0
+                    self.contact = False
+                    self.probe_future.set_result(current_pose)
+
+
+                self.publish_probe_twist(-0.01)
+
+
+            case ProbingState.IDLE:
+                pass
+    
+    def probe_point(self):
+        print("creating future")
+        future = Future()
+        self.probe_future = future
+
+        self.probing_state = ProbingState.PROBING
+        return self.probe_future
+
+    def calibrate(self):
+        self.get_logger().info("Probing P1")
+        p1_future = self.probe_point()
+        rclpy.spin_until_future_complete(self, p1_future)
+        self.p1_pose = p1_future.result()
+        time.sleep(1) # Wait for publisher to finish
+        self.get_logger().info("P1 recorded")
         
+        self.get_logger().info("Move to P2")
+        next_pose = self.compute_relative_pose(self.p1_pose, 0, 0.05, 0.01)
+        trajectory = self.compute_cartesian_path([next_pose])
+        self.execute_trajectory(trajectory)
+
+        time.sleep(2)
+        self.no_motion_counter = 0
+
+        self.get_logger().info("Probing P2")
+        p2_future = self.probe_point()
+        rclpy.spin_until_future_complete(self, p2_future)
+        self.p2_pose = p2_future.result()
+        time.sleep(1) # Wait for publisher to finish
+        self.get_logger().info("P2 recorded")
+
+        self.get_logger().info("Move to P3")
+        next_pose = self.compute_relative_pose(self.p2_pose, -0.05, 0, 0.01)
+        trajectory = self.compute_cartesian_path([next_pose])
+        self.execute_trajectory(trajectory)
+
+        time.sleep(2)
+        self.no_motion_counter = 0
+
+        self.get_logger().info("Probing P3")
+        p3_future = self.probe_point()
+        rclpy.spin_until_future_complete(self, p3_future)
+        self.p3_pose = p3_future.result()
+        time.sleep(1) # Wait for publisher to finish
+        self.get_logger().info("P3 recorded")
+
+        time.sleep(2)
+        self.no_motion_counter = 0
+
+        self.get_logger().info("Move to rest")
+        next_pose = self.compute_relative_pose(self.p3_pose, 0.05, -0.05, 0.01)
+        trajectory = self.compute_cartesian_path([next_pose])
+        self.execute_trajectory(trajectory)
+
+        print("P1: ", self.p1_pose)
+        print("P2: ", self.p2_pose)
+        print("P3: ", self.p3_pose)
+
+    def compute_relative_pose(self, ref_pose, dx, dy, dz):
+        target = copy.deepcopy(ref_pose)
+        target.position.x += dx
+        target.position.y += dy
+        target.position.z += dz
+        return target
+
+    def move_relative(self):
+        current = self.get_current_tcp_pose()
+        target = self.compute_relative_pose(current, 0, 0, 0.01)
+        trajectory = self.compute_cartesian_path([target])
+        self.execute_trajectory(trajectory)
+    
     def publish_probe_twist(self, z_velocity):
         """
         Commands the end-effector to probe slowly until it
@@ -90,7 +180,7 @@ class InVitroPlanner(Node):
         msg.twist.linear.z = z_velocity
         self.delta_twist_pub.publish(msg)
 
-    def contact_detected(self):
+    def detect_contact(self):
         """
         Detects contact with a surface by reading the
         contact state read by the Arduino Nano
@@ -105,56 +195,7 @@ class InVitroPlanner(Node):
         else:
             self.no_motion_counter = 0
 
-        return self.no_motion_counter >= self.required_stationary_cycles
-
-    def control_loop(self):
-        """
-        Controls the robot arm as a state machine...
-        Will be scaled and further developed...
-        """
-        match self.state:
-            case State.IDLE:
-                pass
-            case State.PROBING_P1:
-                if self.contact_detected():
-                    self.publish_probe_twist(0.00)
-                    self.p1_pose = self.get_current_tcp_pose()
-
-                    next_point = copy.copy(self.p1_pose)
-                    # next_point.position.y = next_point.position.y + 0.030
-                    next_point.position.z = next_point.position.z + 0.010
-
-                    def callback(future):
-                        trajectory = future.result().solution
-                        print("trajectory here: ", trajectory)
-
-                        def execution_callback(*args):
-                            self.state = State.PROBING_P2
-
-                        self.execute_trajectory(trajectory, callback=execution_callback)
-
-                        self.state = State.EXECUTING_TRAJECTORY
-                        print("Trajectory obtained! Executing...")
-
-                    self.compute_cartesian_path([next_point], callback=callback)
-                    self.state = State.CALCULATING_PATH
-                    self.no_motion_counter = 0
-                    return
-
-                self.publish_probe_twist(-0.01)
-
-            case State.CALCULATING_PATH:
-                print("Awaiting path...")
-                pass
-
-            case State.EXECUTING_TRAJECTORY:
-                print("Executing...")
-                pass
-
-            case State.PROBING_P2:
-                print("now probing P2...")
-                pass
-
+        self.contact = self.no_motion_counter >= self.required_stationary_cycles
 
     def gcode_to_waypoints(self, gcode_path: str, current_pose: Pose):
         """
@@ -232,10 +273,15 @@ class InVitroPlanner(Node):
 
         pose = Pose()
 
-        # Quaternior position not needed
         pose.position.x = transform.transform.translation.x
         pose.position.y = transform.transform.translation.y
         pose.position.z = transform.transform.translation.z
+
+        # actually quaternion is indeed required
+        pose.orientation.x = transform.transform.rotation.x
+        pose.orientation.y = transform.transform.rotation.y
+        pose.orientation.z = transform.transform.rotation.z
+        pose.orientation.w = transform.transform.rotation.w
 
         # For debugging purposes
         self.get_logger().info(
@@ -285,8 +331,6 @@ class InVitroPlanner(Node):
 
             if result is None:
                 raise RuntimeError("Cartesian planning call failed.")
-            if path_fraction < 1.00:
-                raise RuntimeError("Unable to execute path. Please reposition robot.")
 
             return result.solution
     
@@ -303,7 +347,21 @@ class InVitroPlanner(Node):
         send_goal_future = self.execute_client.send_goal_async(goal)
 
         if callback:
-            send_goal_future.add_done_callback(callback)
+            
+            def goal_response_cb(future):
+                goal_handle = future.result()
+                if not goal_handle.accepted:
+                    self.get_logger().error("Trajectory execution rejected")
+                    return
+                
+                self.get_logger().info(f"Accepted = {goal_handle.accepted}")
+
+                result_future = goal_handle.get_result_async()
+                self.get_logger().info("Executing trajectory...")
+
+                result_future.add_done_callback(callback)
+            
+            send_goal_future.add_done_callback(callback=goal_response_cb)
 
         else:
             rclpy.spin_until_future_complete(self, send_goal_future)
@@ -380,16 +438,23 @@ class InVitroPlanner(Node):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=["probe", "execute_print", "orient"])
+    parser.add_argument("command", choices=["calibrate", "move_relative", "execute_print", "orient"])
     args = parser.parse_args()
 
     rclpy.init()
     node = InVitroPlanner()
 
+    # case "probe":
+    # node.state = State.PROBING_P1
+    # rclpy.spin(node)
+
     match args.command:
-        case "probe":
-            node.state = State.PROBING_P1
-            rclpy.spin(node)
+        case "calibrate":
+            node.calibrate()
+            node.destroy_node()
+        case "move_relative":
+            node.move_relative()
+            node.destroy_node()
         case "execute_print":
             node.execute_print()
             node.destroy_node()
@@ -402,3 +467,55 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+"""
+def control_loop(self):
+    match self.state:
+        case State.IDLE:
+            pass
+        case State.PROBING_P1:
+
+            if self.contact_detected():
+
+                # Stop moving end-effector
+                self.publish_probe_twist(0.00)
+
+                # Store P1 for plane fitting
+                self.p1_pose = self.get_current_tcp_pose()
+
+                self.state = State.IDLE # Just a placeholder for now
+                
+                self.move_relative(10, 10, 10, State.PROBING_P2)
+
+            self.publish_probe_twist(-0.01)
+
+        case State.CALCULATING_PATH:
+            print("Awaiting path...")
+            pass
+
+        case State.EXECUTING_TRAJECTORY:
+            print("Executing...")
+            pass
+
+        case State.PROBING_P2:
+            self.publish_probe_twist(0.01)
+            print("now probing P2...")
+
+def _path_ready(self, future, end_state):
+    result = future.result()
+    trajectory = result.solution
+
+    self.get_logger().info(f"Trajectory fraction: {result.fraction}")
+
+    def cb(future):
+        result = future.result()
+        print(result)
+        self._execution_finished(end_state)
+
+    self.execute_trajectory(trajectory=trajectory, callback=cb)
+
+def _execution_finished(self, end_state):
+    self.get_logger().info(f"Execution finished callback... setting state {end_state}")
+    self.state = end_state
+                    
+"""
