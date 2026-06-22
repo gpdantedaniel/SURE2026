@@ -5,6 +5,7 @@ import yaml
 import time
 import rclpy
 import serial
+import numpy as np
 from geometry_msgs.msg import Pose
 from rosidl_runtime_py import message_to_yaml, set_message_fields
 from enum import Enum, auto
@@ -221,50 +222,48 @@ class InVitroPlanner(Node):
         # More deterministic filtering algorithm required - specific to Prusa Slicer
         filtered_lines = filtered_lines[14:-2]
 
-        # Holds the sequentially updated position
+        # Holds the presently parsed waypoint
         coords = {"x": 0.0, "y": 0.0, "z": 0.0}
         waypoints = []
 
-        # Read each GCODE position
         for line in filtered_lines:
             for code in line.split(" "):
                 match code[0]:
                     case "X":
-                        coords["x"] = float(code[1:])
+                        coords["x"] = float(code[1:])/1000
                     case "Y":
-                        coords["y"] = float(code[1:])
+                        coords["y"] = float(code[1:])/1000
                     case "Z":
-                        coords["z"] = float(code[1:])
+                        coords["z"] = float(code[1:])/1000
+
+            waypoints.append(np.array([
+                coords["x"],
+                coords["y"],
+                coords["z"]
+            ]))
+
+        waypoints = np.array(waypoints)
+        distance = np.sqrt(waypoints[:, 0]**2 + waypoints[:, 1]**2)
+        waypoints = waypoints - waypoints[int(np.argmin(distance))]
+    
+        poses = []
+
+        for w in waypoints:
 
             pose = Pose()
 
-            # Scale positions from mm to m
-            pose.position.x = coords["x"]/1000
-            pose.position.y = coords["y"]/1000
-            pose.position.z = coords["z"]/1000
+            pose.position.x = float(w[0]) + current_pose.position.x
+            pose.position.y = float(w[1]) + current_pose.position.y
+            pose.position.z = float(w[2]) + current_pose.position.z
 
-            # Orient tool_link downwards
             pose.orientation.x = 0.0
             pose.orientation.y = 1.0
             pose.orientation.z = 0.0
             pose.orientation.w = 0.0
 
-            waypoints.append(pose)
+            poses.append(pose)
 
-        start_waypoint = copy.deepcopy(waypoints[0])
-
-        for w in waypoints:
-            # Normalize subsequent positions with respect to print start
-            w.position.x = w.position.x - start_waypoint.position.x
-            w.position.y = w.position.y - start_waypoint.position.y
-            w.position.z = w.position.z - start_waypoint.position.z
-
-            # Normalize with respect to current pose (refactor later)
-            w.position.x = w.position.x + current_pose.position.x
-            w.position.y = w.position.y + current_pose.position.y
-            w.position.z = w.position.z + current_pose.position.z
-
-        return waypoints
+        return poses
         
     def get_current_tcp_pose(self):
         """
@@ -421,13 +420,59 @@ class InVitroPlanner(Node):
         self.execute_trajectory(trajectory)
         self.get_logger().info("Trajectory complete.")
 
+    def read_pose_coordinates(self, pose_filename):
+        with open(f"../poses/{pose_filename}.yaml", "r") as file:
+            yaml_data = yaml.safe_load(file)
+
+        coords = yaml_data["position"]
+        position = np.array([coords['x'], coords['y'], coords['z']])
+        return position
+
+    def transform_waypoints(self, waypoints):
+        p1 = self.read_pose_coordinates("plane_p1")
+        p2 = self.read_pose_coordinates("plane_p2")
+        p3 = self.read_pose_coordinates("plane_p3")
+
+        u = p2 - p1
+        v = p3 - p1
+        n = np.cross(u, v)
+
+        x_p = u / np.linalg.norm(u)
+        z_p = n / np.linalg.norm(n)
+        y_p = np.cross(x_p, z_p) / np.linalg.norm(np.cross(x_p, z_p))
+
+        R = np.column_stack((x_p, y_p, z_p))
+        t = p1
+
+        transformed_points = np.array([
+            np.dot(R, np.array([w.position.x, w.position.y, w.position.z])) + t
+            for w in waypoints[14:-2]
+        ])
+
+        transformed_waypoints = []
+
+        for a in transformed_points:
+            pose = Pose()
+
+            pose.position.x = a[0]
+            pose.position.y = a[1]
+            pose.position.z = a[2]
+
+            # Orient downwards
+            pose.orientation.x = 0.0
+            pose.orientation.y = 1.0
+            pose.orientation.z = 0.0
+            pose.orientation.w = 0.0
+
+            transformed_waypoints.append(pose)
+
+        return transformed_waypoints
+
     def execute_print(self):
         """
         Computes and executes printing trajectory based on GCODE 
         file gcode_file requested and provided at startup
         """
-        current_pose = self.get_current_tcp_pose()
-
         # Read GCODE lines and parse into waypoints
         gcode_file = self.get_parameter("gcode_file").value
         self.get_logger().info(f"Reading {gcode_file}")
@@ -435,11 +480,15 @@ class InVitroPlanner(Node):
         package_share_dir = get_package_share_directory('bioprinting')
         gcode_path = os.path.join(package_share_dir, gcode_file)
 
-        # Should be renamed gcode_to_waypoints
-        waypoints = self.gcode_to_waypoints(gcode_path, current_pose)
+        p1 = self.load_pose("plane_p3")
+
+        waypoints = self.gcode_to_waypoints(gcode_path, p1)
+
+        # EXPERIMENTAL : apply rigid transform on waypoints
+        transformed_waypoints = self.transform_waypoints(waypoints)
         
         self.get_logger().info("Computing trajectory...")
-        trajectory = self.compute_cartesian_path(waypoints)
+        trajectory = self.compute_cartesian_path(transformed_waypoints)
         self.get_logger().info("Trajectory computed.")
 
         self.get_logger().info("Executing trajectory...")
@@ -452,7 +501,7 @@ commands = {
     "execute_print": lambda node: node.execute_print(),
     "orient": lambda node: node.orient(),
     "save_current_pose": lambda node: node.save_current_pose(),
-    "assume_pose": lambda node: node.assume_pose() 
+    "park": lambda node: node.assume_pose() 
 }
 
 def main():
