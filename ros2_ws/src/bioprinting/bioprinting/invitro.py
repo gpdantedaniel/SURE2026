@@ -144,63 +144,40 @@ class InVitroPlanner(Node):
                 pass
     
     def probe_point(self):
+        self.get_logger().info("Probing point...")
         future = Future()
         self.probe_future = future
         self.probing_state = ProbingState.PROBING
-        return self.probe_future
+        rclpy.spin_until_future_complete(self, future)
+        pose = future.result()
+
+        return pose
 
     def calibrate(self):
-        self.get_logger().info("Probing P1")
-        p1_future = self.probe_point()
+        """
+        Calibration proceeds through three points that are saved locally
+        to perform plane fitting subsequently and 3D print!
+        """
 
-        rclpy.spin_until_future_complete(self, p1_future)
-        p1_pose = p1_future.result()
+        # Some hard-coded values...
+        # can be dynamically populated later
 
-        time.sleep(1) # Wait for publisher to finish
-        self.get_logger().info("P1 recorded")
+        points_and_offsets = {
+            "plane_p1": {"dx": 0, "dy": 0.05, "dz": 0.01},
+            "plane_p2": {"dx": -0.05, "dy": 0, "dz": 0.01},
+            "plane_p3": {"dx": 0.05, "dy": -0.05, "dz": 0.01}
+        }
 
-        self.get_logger().info("Moving to probe P2")
-        self.move_relative_to(p1_pose, 0, 0.05, 0.01)
-
-        time.sleep(2)
-        self.no_motion_counter = 0
-
-        self.get_logger().info("Probing P2")
-        p2_future = self.probe_point()
-
-        rclpy.spin_until_future_complete(self, p2_future)
-        p2_pose = p2_future.result()
-
-        time.sleep(1) # Wait for publisher to finish
-        self.get_logger().info("P2 recorded")
-
-        self.get_logger().info("Moving to probe P3")
-        self.move_relative_to(p2_pose, -0.05, 0, 0.01)
-
-        time.sleep(2)
-        self.no_motion_counter = 0
-
-        self.get_logger().info("Probing P3")
-        p3_future = self.probe_point()
-
-        rclpy.spin_until_future_complete(self, p3_future)
-        p3_pose = p3_future.result()
-
-        time.sleep(1) # Wait for publisher to finish
-        self.get_logger().info("P3 recorded")
-
-        time.sleep(2)
-        self.no_motion_counter = 0
-
-        self.get_logger().info("Moving to rest above P1")
-        self.move_relative_to(p3_pose, 0.05, -0.05, 0.01)
-
-        self.get_logger().info("Saving poses...")
-
-        self.save_pose(p1_pose, "plane_p1")
-        self.save_pose(p2_pose, "plane_p2")
-        self.save_pose(p3_pose, "plane_p3")
-
+        for point_name, end_offset in points_and_offsets.items():
+            pose = self.probe_point()
+            self.save_pose(pose, point_name)
+            self.get_logger().info(f"{point_name} recorded")
+            
+            time.sleep(1)
+            self.move_relative_to(pose, end_offset["dx"], end_offset["dy"], end_offset["dz"])
+            time.sleep(1)
+        
+        self.get_logger().info("✅ Calibration successful!")
 
     
     def publish_probe_twist(self, z_velocity):
