@@ -16,11 +16,14 @@ from rclpy.task import Future
 from rclpy.action import ActionClient
 from action_msgs.srv import CancelGoal
 from rclpy.parameter import Parameter
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from geometry_msgs.msg import Pose, TwistStamped
 from sensor_msgs.msg import JointState
 from moveit_msgs.srv import GetCartesianPath
 from moveit_msgs.action import ExecuteTrajectory
 from moveit.planning import MoveItPy
+from trajectory_msgs.msg import JointTrajectory
+from trajectory_msgs.msg import JointTrajectoryPoint
 from ament_index_python.packages import get_package_share_directory
 
 # Useful for filtering and parsing GCODE
@@ -32,6 +35,10 @@ nano_serial = serial.Serial(
     baudrate=115200,
     timeout=0.001
 )
+
+qos_joint_trajectory = QoSProfile(depth=10)
+qos_joint_trajectory.reliability = ReliabilityPolicy.BEST_EFFORT
+qos_joint_trajectory.durability = DurabilityPolicy.VOLATILE
 
 class ProbingState(Enum):
     IDLE = auto()
@@ -57,6 +64,12 @@ class InVitroPlanner(Node):
         self.execute_client = ActionClient(self, ExecuteTrajectory, "/execute_trajectory")
         self.delta_twist_pub= self.create_publisher(TwistStamped, "/servo_node/delta_twist_cmds", 10)
 
+        self.joint_state_sub = self.create_subscription(JointState, "/joint_states", self.joint_state_callback, 10)
+        self.joint_trajectory_pub = self.create_publisher(JointTrajectory, "/joint_trajectory_controller/joint_trajectory", qos_joint_trajectory)
+
+        self.latest_positions = None
+        self.joint_name_to_index = None
+
         # Old control loop for calibration
         self.probing_timer = self.create_timer(0.02, self.probing_loop)
         self.contact_timer = self.create_timer(0.02, self.detect_contact)
@@ -78,6 +91,21 @@ class InVitroPlanner(Node):
         self.execute_client.wait_for_server()
         self.get_logger().info("✅ Connected to MoveIt!")
 
+    # ----- Tracking joint state
+
+    def joint_state_callback(self, msg):
+        if self.joint_name_to_index is None:
+            print("Building mapping...")
+            self.joint_name_to_index = {name: i for i, name in enumerate(msg.name)}
+            print(self.joint_name_to_index)
+
+        self.latest_positions = msg.position
+
+    def get_q(self):
+        if self.latest_positions is None:
+            return None
+        return self.latest_positions
+    
     # ----- Utility functions
 
     def save_pose(self, pose, filename):
@@ -493,7 +521,32 @@ class InVitroPlanner(Node):
 
         self.get_logger().info("Executing trajectory...")
         self.execute_trajectory(trajectory)
-        self.get_logger().info("Trajectory complete.")    
+        self.get_logger().info("Trajectory complete.")
+
+    def diagnose_backlash(self):
+
+        q = self.get_q()
+
+        q1 = q[self.joint_name_to_index["joint_1"]]
+        q2 = q[self.joint_name_to_index["joint_2"]]
+        q3 = q[self.joint_name_to_index["joint_3"]]
+        q4 = q[self.joint_name_to_index["joint_4"]]
+        q5 = q[self.joint_name_to_index["joint_5"]]
+        q6 = q[self.joint_name_to_index["joint_6"]]
+
+
+
+        self.get_logger().info("Diagnosing backlash...")
+
+        msg = JointTrajectory()
+        msg.joint_names=["joint_6"]
+
+        point = JointTrajectoryPoint()
+        point.positions = [20]
+        point.time_from_start.sec = 2
+
+        msg.points.append(point)
+        self.joint_trajectory_pub.publish(msg)
 
 commands = {
     "calibrate": lambda node: node.calibrate(),
@@ -501,7 +554,8 @@ commands = {
     "execute_print": lambda node: node.execute_print(),
     "orient": lambda node: node.orient(),
     "save_current_pose": lambda node: node.save_current_pose(),
-    "park": lambda node: node.assume_pose() 
+    "park": lambda node: node.assume_pose(),
+    "diagnose_backlash": lambda node: node.diagnose_backlash()
 }
 
 def main():
@@ -512,7 +566,10 @@ def main():
     rclpy.init(args=ros_args)
     node = InVitroPlanner()
 
+    rclpy.spin(node)
+
     commands[parsed_args.command](node)
+    
     node.destroy_node()
 
     nano_serial.close()
