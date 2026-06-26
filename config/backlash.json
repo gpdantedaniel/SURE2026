@@ -1,0 +1,26 @@
+{
+    "joint_5": {
+        "joint_idx": 4,
+        "pos_b": 6.0,
+        "neg_b": 2.0,
+        "tot_b": 8.0
+    },
+    "joint_6": {
+        "joint_idx": 5,
+        "pos_b": 0.75,
+        "neg_b": 0.5,
+        "tot_b": 1.25
+    },
+    "joint_3": {
+        "joint_idx": 2,
+        "pos_b": 1.5,
+        "neg_b": 0.5,
+        "tot_b": 2.0
+    },
+    "joint_4": {
+        "joint_idx": 3,
+        "pos_b": 1.0,
+        "neg_b": 0.5,
+        "tot_b": 1.5
+    }
+}

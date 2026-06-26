@@ -3,6 +3,7 @@ import copy
 import os
 import yaml
 import time
+import json
 import rclpy
 import serial
 import numpy as np
@@ -37,7 +38,7 @@ nano_serial = serial.Serial(
 )
 
 qos_joint_trajectory = QoSProfile(depth=10)
-qos_joint_trajectory.reliability = ReliabilityPolicy.BEST_EFFORT
+qos_joint_trajectory.reliability = ReliabilityPolicy.RELIABLE
 qos_joint_trajectory.durability = DurabilityPolicy.VOLATILE
 
 class ProbingState(Enum):
@@ -58,6 +59,7 @@ class InVitroPlanner(Node):
         # Declare parameters and defaults
         self.declare_parameter("gcode_file", "")
         self.declare_parameter("pose_filename", "")
+        self.declare_parameter("target_joint", "")
 
         # For computing and executing trajectories
         self.cartesian_client = self.create_client(GetCartesianPath, "/compute_cartesian_path")
@@ -90,21 +92,6 @@ class InVitroPlanner(Node):
         self.cartesian_client.wait_for_service()
         self.execute_client.wait_for_server()
         self.get_logger().info("✅ Connected to MoveIt!")
-
-    # ----- Tracking joint state
-
-    def joint_state_callback(self, msg):
-        if self.joint_name_to_index is None:
-            print("Building mapping...")
-            self.joint_name_to_index = {name: i for i, name in enumerate(msg.name)}
-            print(self.joint_name_to_index)
-
-        self.latest_positions = msg.position
-
-    def get_q(self):
-        if self.latest_positions is None:
-            return None
-        return self.latest_positions
     
     # ----- Utility functions
 
@@ -345,32 +332,28 @@ class InVitroPlanner(Node):
         req.max_step = 0.005
         req.jump_threshold = 0.0
         req.avoid_collisions = True
-        req.max_velocity_scaling_factor = 1.0
-        req.max_acceleration_scaling_factor = 1.0
+        req.max_velocity_scaling_factor = 0.5
+        req.max_acceleration_scaling_factor = 0.5
 
         # Send out the request asynchronously
         self.get_logger().info("Calling cartesian path compute")
         future = self.cartesian_client.call_async(req)
 
-        # Should be refined afterwards
-        if callback:
-            future.add_done_callback(callback)
-        else:
-            # Get the service to spin and read result
-            self.get_logger().info("Waiting for response")
-            rclpy.spin_until_future_complete(self, future)
+        # Get the service to spin and read result
+        self.get_logger().info("Waiting for response")
+        rclpy.spin_until_future_complete(self, future)
 
-            
-            self.get_logger().info("Response received")
-            result = future.result()
+        
+        self.get_logger().info("Response received")
+        result = future.result()
 
-            path_fraction = result.fraction
-            self.get_logger().info(f"Path fraction: {path_fraction:.3f}")
+        path_fraction = result.fraction
+        self.get_logger().info(f"Path fraction: {path_fraction:.3f}")
 
-            if result is None:
-                raise RuntimeError("Cartesian planning call failed.")
-
-            return result.solution
+        if result is None:
+            raise RuntimeError("Cartesian planning call failed.")
+        
+        return result.solution
     
     def execute_trajectory(self, trajectory: ExecuteTrajectory, callback=None):
         """
@@ -444,6 +427,9 @@ class InVitroPlanner(Node):
         trajectory = self.compute_cartesian_path([downards_pose])
         self.get_logger().info("Trajectory computed.")
 
+        self.get_logger().info(f"🔧 Compensating backlash...")
+        trajectory = self.compensate_backlash_j5(trajectory)
+
         self.get_logger().info("Executing trajectory...")
         self.execute_trajectory(trajectory)
         self.get_logger().info("Trajectory complete.")
@@ -512,41 +498,161 @@ class InVitroPlanner(Node):
 
         waypoints = self.gcode_to_waypoints(gcode_path, p1)
 
-        # EXPERIMENTAL : apply rigid transform on waypoints
-        transformed_waypoints = self.transform_waypoints(waypoints)
+        # EXPERIMENTAL : should be fixed... for some reason sending to infinity... likely how gcode is read
+        # waypoints = self.transform_waypoints(waypoints)
+
         
         self.get_logger().info("Computing trajectory...")
-        trajectory = self.compute_cartesian_path(transformed_waypoints)
+        trajectory = self.compute_cartesian_path(waypoints)
+
+        # EXPERIMENTAL : compensating backlash... should be tuned
+        trajectory = self.compensate_backlash_j5(trajectory)
+
         self.get_logger().info("Trajectory computed.")
 
         self.get_logger().info("Executing trajectory...")
         self.execute_trajectory(trajectory)
         self.get_logger().info("Trajectory complete.")
 
-    def diagnose_backlash(self):
+    # ----- New methods for (hopefully functionally) diagnosing backlash
 
-        q = self.get_q()
+    def joint_state_callback(self, msg):
+        if self.joint_name_to_index is None:
+            self.joint_names = list(msg.name)
+            self.joint_name_to_index = {name: i for i, name in enumerate(msg.name)}
 
-        q1 = q[self.joint_name_to_index["joint_1"]]
-        q2 = q[self.joint_name_to_index["joint_2"]]
-        q3 = q[self.joint_name_to_index["joint_3"]]
-        q4 = q[self.joint_name_to_index["joint_4"]]
-        q5 = q[self.joint_name_to_index["joint_5"]]
-        q6 = q[self.joint_name_to_index["joint_6"]]
+            self.get_logger().info(f"🦾 Found joints:")
+            for name in self.joint_names:
+                self.get_logger().info(f"---- {name}")
 
+        self.latest_positions = msg.position
 
+    def get_q(self):
+        if self.latest_positions is None: return None
+        return self.latest_positions
 
-        self.get_logger().info("Diagnosing backlash...")
+    def wait_for_joint_states(self, timeout_sec=5.0):
+        start = time.time()
+        while rclpy.ok():
+            rclpy.spin_once(self, timeout_sec=0.1)
+            if (self.latest_positions is not None and self.joint_name_to_index is not None):
+                return
+            if time.time() - start > timeout_sec:
+                raise RuntimeError("TImed out waiting for /joint_states")
 
+    def publish_joint_configuration(self, positions, move_time_sec=2):
         msg = JointTrajectory()
-        msg.joint_names=["joint_6"]
-
         point = JointTrajectoryPoint()
-        point.positions = [20]
-        point.time_from_start.sec = 2
-
+        point.positions = list(positions)
+        point.time_from_start.sec = move_time_sec
+        msg.joint_names = list(self.joint_name_to_index.keys())
         msg.points.append(point)
         self.joint_trajectory_pub.publish(msg)
+
+    def probe_backlash(self, base_q, joint_name, joint_idx, sign):
+        # Hard-coded values... subject to configuration
+        preload_deg, step_deg, max_deg = -10.0 * sign, 1.0, 8.0
+        
+        # Preload joint for inspection
+        preload_q = base_q.copy()
+        preload_q[joint_idx] += np.deg2rad(preload_deg)
+        self.publish_joint_configuration(preload_q)
+        input(f"Preloaded {joint_name} at {preload_deg:.1f} degrees. Press ENTER to continue.")
+
+        for offset_deg in np.arange(step_deg, max_deg + step_deg, step_deg):
+            q = preload_q.copy()
+            q[joint_idx] += np.deg2rad(offset_deg * sign)
+
+            self.publish_joint_configuration(q)
+            self.get_logger().info(f"Testing J5 offset = {offset_deg:.2f} deg")
+            answer = input("Did the wrist visibly move? [y = yes, ENTER = continue]")
+
+            if answer == "y":
+                self.get_logger().info(f"Positive threshold = {offset_deg:.2f} deg")
+                return offset_deg
+    
+        self.get_logger().info("Backlash detection inconclusive... returning 0")
+        return 0
+
+    def diagnose_backlash(self):
+        joint_name = self.get_parameter("target_joint").value
+        self.get_logger().info(f"🩺 Running backlash diagnosis on {joint_name}")
+
+        # Read states and identify joint
+        self.wait_for_joint_states()
+        base_q = list(self.get_q())
+        joint_idx = self.joint_name_to_index[joint_name]
+        
+        # Probe in positive and negative directions
+        pos_b = self.probe_backlash(base_q, joint_name, joint_idx, +1)
+        neg_b = self.probe_backlash(base_q, joint_name, joint_idx, -1)
+
+        self.record_backlash(joint_name, joint_idx, pos_b, neg_b)
+
+        self.get_logger().info(f"✅ Finished diagnosing {joint_name}")
+
+    def record_backlash(self, joint_name, joint_idx, pos_b, neg_b):
+
+        file_path = "../config/backlash.json"
+
+        if os.path.exists(file_path):
+            with open(file_path, "r", encoding="utf-8") as file:
+                data = json.load(file)
+        else:
+            data = {}
+
+        data[joint_name] = {
+            "joint_idx": joint_idx,
+            "pos_b": pos_b,
+            "neg_b": neg_b,
+            "tot_b": pos_b + neg_b
+        }
+
+        with open(file_path, "w", encoding="utf-8") as file:
+            json.dump(data, file, indent=4, ensure_ascii=False)
+
+    def compensate_backlash_j5(self, trajectory, backlash_degree=8.0, epsilon_deg=0.01):
+        
+        # Hard-coded stuff for testing just for now...
+        jt = trajectory.joint_trajectory
+        j5_idx = jt.joint_names.index("joint_5")
+
+        backlash_rad = np.deg2rad(backlash_degree)
+        epsilon_rad = np.deg2rad(epsilon_deg)
+
+        previous_direction = 0
+
+        points = jt.points
+
+        # for p in points:
+        #   rad = p.positions[j5_idx]
+        #   self.get_logger().info(f"J5 goes to: {rad}")
+
+        for i in range(1, len(points)):
+            current = points[i].positions[j5_idx]
+            previous = points[i - 1].positions[j5_idx]
+
+            delta = current - previous
+
+            # self.get_logger().info(f"{current} - {previous} = {delta}")
+
+            if abs(delta) < epsilon_rad:
+                continue
+
+            direction = np.sign(delta)
+
+            # self.get_logger().info(f"delta: {delta} & direction: {str(direction)}")
+
+            if (previous_direction != 0 and direction != previous_direction):
+                corrected = list(points[i].positions)
+                corrected[j5_idx] += direction * backlash_rad / 2
+                points[i].positions = corrected
+
+                self.get_logger().info("🔄 Reversing!")
+
+            previous_direction = direction
+        
+        return trajectory
 
 commands = {
     "calibrate": lambda node: node.calibrate(),
@@ -566,7 +672,7 @@ def main():
     rclpy.init(args=ros_args)
     node = InVitroPlanner()
 
-    rclpy.spin(node)
+    rclpy.spin_once(node, timeout_sec=0.1)
 
     commands[parsed_args.command](node)
     
