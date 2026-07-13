@@ -5,7 +5,6 @@ import yaml
 import time
 import json
 import rclpy
-import serial
 import numpy as np
 from geometry_msgs.msg import Pose
 from rosidl_runtime_py import message_to_yaml, set_message_fields
@@ -27,15 +26,20 @@ from trajectory_msgs.msg import JointTrajectory
 from trajectory_msgs.msg import JointTrajectoryPoint
 from ament_index_python.packages import get_package_share_directory
 
+import sys
+import select
+
 # Useful for filtering and parsing GCODE
 accepted_codes = ("G0", "G1", "G90", "G91")
 rejected_actuations = ("E", "F")
 
+"""
 nano_serial = serial.Serial(
     port="/dev/ttyUSB0",
     baudrate=115200,
     timeout=0.001
 )
+"""
 
 qos_joint_trajectory = QoSProfile(depth=10)
 qos_joint_trajectory.reliability = ReliabilityPolicy.RELIABLE
@@ -73,15 +77,13 @@ class InVitroPlanner(Node):
         self.joint_name_to_index = None
 
         # Old control loop for calibration
-        self.probing_timer = self.create_timer(0.02, self.probing_loop)
-        self.contact_timer = self.create_timer(0.02, self.detect_contact)
-        self.probing_state = ProbingState.IDLE
-        self.probe_future = None
-
-        # Probing (subject to tuning)
-        self.contact = 0
-        self.no_motion_counter = 0
-        self.required_stationary_cycles = 1
+        # self.probing_timer = self.create_timer(0.02, self.probing_loop)
+        # self.contact_timer = self.create_timer(0.02, self.detect_contact)
+        # self.probing_state = ProbingState.IDLE
+        # self.probe_future = None
+        # self.contact = 0
+        # self.no_motion_counter = 0
+        # self.required_stationary_cycles = 1
 
         # Listen to tool_link's Pose
         self.tf_buffer = Buffer()
@@ -168,6 +170,43 @@ class InVitroPlanner(Node):
         pose = future.result()
 
         return pose
+    
+    def stop_probe_motion(self, repeats=10, period=0.02):
+        for _ in range(repeats):
+            self.publish_probe_twist(0.0)
+            rclpy.spin_once(self, timeout_sec=0.0)
+            time.sleep(period)
+    
+    def manual_probe_point(self, point_name, z_velocity=-0.001, period=0.02, timeout_sec=30.0):
+        self.get_logger().info(f"Ready to manually probe {point_name}")
+        self.get_logger().info("Place tool above the intended contact point.")
+        input("Press ENTER to begin descent")
+
+        self.get_logger().info(f"Descending at {abs(z_velocity) * 1000:.1f} mm/s")
+
+        start_time = time.time()
+
+        try:
+            while rclpy.ok():
+                if sys.stdin in select.select([sys.stdin], [], [], 0.0)[0]:
+                    sys.stdin.readline()
+                    self.get_logger().info("ENTER detected! Halting trigger received...")
+                    break
+                if time.time() - start_time > timeout_sec:
+                    raise RuntimeError("Manual probing timed out:(")
+                
+                self.publish_probe_twist(z_velocity)
+                rclpy.spin_once(self, timeout_sec=0.0)
+                time.sleep(period)
+        
+        finally:
+            self.stop_probe_motion()
+
+        time.sleep(0.1)
+        pose = self.get_current_tcp_pose()
+        self.get_logger().info(f"Recorded manual probe pose for {point_name}")
+        return pose
+
 
     def calibrate(self):
         """
@@ -179,17 +218,20 @@ class InVitroPlanner(Node):
         # can be dynamically populated later
 
         points_and_offsets = {
-            "plane_p1": {"dx": 0, "dy": 0.05, "dz": 0.01},
-            "plane_p2": {"dx": -0.05, "dy": 0, "dz": 0.01},
-            "plane_p3": {"dx": 0.05, "dy": -0.05, "dz": 0.01}
+            "plane_p1": {"dx": 0, "dy": 0.05, "dz": 0.005},
+            "plane_p2": {"dx": -0.05, "dy": 0, "dz": 0.005},
+            "plane_p3": {"dx": 0.05, "dy": -0.05, "dz": 0.005}
         }
 
         for point_name, end_offset in points_and_offsets.items():
-            pose = self.probe_point()
+            # pose = self.probe_point()
+            pose = self.manual_probe_point(point_name)
+
             self.save_pose(pose, point_name)
             self.get_logger().info(f"{point_name} recorded")
             
             time.sleep(1)
+            self.get_logger().info("Moving above next probing region...")
             self.move_relative_to(pose, end_offset["dx"], end_offset["dy"], end_offset["dz"])
             time.sleep(1)
         
@@ -207,6 +249,7 @@ class InVitroPlanner(Node):
         msg.twist.linear.z = z_velocity
         self.delta_twist_pub.publish(msg)
 
+    '''
     def detect_contact(self):
         """
         Detects contact with a surface by reading the
@@ -223,6 +266,7 @@ class InVitroPlanner(Node):
             self.no_motion_counter = 0
 
         self.contact = self.no_motion_counter >= self.required_stationary_cycles
+    '''
 
     def gcode_to_waypoints(self, gcode_path: str, current_pose: Pose):
         """
@@ -235,41 +279,60 @@ class InVitroPlanner(Node):
         # Preprocessing should probably be refined later
         filtered_lines = list(filter(lambda l: l.startswith(accepted_codes), gcode_lines))
         # More deterministic filtering algorithm required - specific to Prusa Slicer
-        filtered_lines = filtered_lines[14:-2]
+        filtered_lines = filtered_lines[15:-2]
 
         # Holds the presently parsed waypoint
         coords = {"x": 0.0, "y": 0.0, "z": 0.0}
         waypoints = []
 
         for line in filtered_lines:
-            for code in line.split(" "):
-                match code[0]:
-                    case "X":
-                        coords["x"] = float(code[1:])/1000
-                    case "Y":
-                        coords["y"] = float(code[1:])/1000
-                    case "Z":
-                        coords["z"] = float(code[1:])/1000
+            if "X" in line or "Y" in line or "Z" in line:
+                for code in line.split(" "):
+                    match code[0]:
+                        case "X":
+                            coords["x"] = float(code[1:])/1000
+                        case "Y":
+                            coords["y"] = float(code[1:])/1000
+                        case "Z":
+                            coords["z"] = float(code[1:])/1000
 
-            waypoints.append(np.array([
-                coords["x"],
-                coords["y"],
-                coords["z"]
-            ]))
+                waypoints.append(np.array([
+                    coords["x"],
+                    coords["y"],
+                    coords["z"]
+                ]))
 
         waypoints = np.array(waypoints)
         distance = np.sqrt(waypoints[:, 0]**2 + waypoints[:, 1]**2)
-        waypoints = waypoints - waypoints[int(np.argmin(distance))]
-    
+        waypoints = waypoints - waypoints[0]
+
+        origin = np.array([[
+            current_pose.position.x,
+            current_pose.position.y,
+            current_pose.position.z
+        ]])
+
+        print('translated waypoints: ')
+        for w in waypoints:
+            print(w)
+
+        waypoints = waypoints + origin
+
+        print('origin: ', origin)
+
+        print("waypoints: ")
+        for w in waypoints:
+            print(w)
+
         poses = []
 
         for w in waypoints:
 
             pose = Pose()
 
-            pose.position.x = float(w[0]) + current_pose.position.x
-            pose.position.y = float(w[1]) + current_pose.position.y
-            pose.position.z = float(w[2]) + current_pose.position.z
+            pose.position.x = float(w[0])
+            pose.position.y = float(w[1])
+            pose.position.z = float(w[2])
 
             pose.orientation.x = 0.0
             pose.orientation.y = 1.0
@@ -332,8 +395,18 @@ class InVitroPlanner(Node):
         req.max_step = 0.005
         req.jump_threshold = 0.0
         req.avoid_collisions = True
-        req.max_velocity_scaling_factor = 0.5
-        req.max_acceleration_scaling_factor = 0.5
+
+        print("gcode file: ", self.get_parameter("gcode_file"))
+
+        if self.get_parameter("gcode_file").value != "":
+            req.max_velocity_scaling_factor = 0.01
+            req.max_acceleration_scaling_factor = 0.01
+        else:
+            req.max_velocity_scaling_factor = 1.0
+            req.max_acceleration_scaling_factor = 1.0
+
+        req.max_velocity_scaling_factor = 1.0
+        req.max_acceleration_scaling_factor = 1.0
 
         # Send out the request asynchronously
         self.get_logger().info("Calling cartesian path compute")
@@ -481,6 +554,7 @@ class InVitroPlanner(Node):
             transformed_waypoints.append(pose)
 
         return transformed_waypoints
+    
 
     def execute_print(self):
         """
@@ -494,19 +568,23 @@ class InVitroPlanner(Node):
         package_share_dir = get_package_share_directory('bioprinting')
         gcode_path = os.path.join(package_share_dir, gcode_file)
 
-        p1 = self.load_pose("plane_p3")
+        p1 = self.load_pose("plane_p1")
 
         waypoints = self.gcode_to_waypoints(gcode_path, p1)
 
         # EXPERIMENTAL : should be fixed... for some reason sending to infinity... likely how gcode is read
         # waypoints = self.transform_waypoints(waypoints)
 
+        self.get_logger().info("Applying -2 mm offset to all waypoints")
+        for w in waypoints:
+            w.position.z = w.position.z - 0.002
+
         
         self.get_logger().info("Computing trajectory...")
         trajectory = self.compute_cartesian_path(waypoints)
 
         # EXPERIMENTAL : compensating backlash... should be tuned
-        trajectory = self.compensate_backlash_j5(trajectory)
+        # trajectory = self.compensate_backlash_j5(trajectory)
 
         self.get_logger().info("Trajectory computed.")
 
@@ -678,7 +756,7 @@ def main():
     
     node.destroy_node()
 
-    nano_serial.close()
+    # nano_serial.close()
     rclpy.shutdown()
 
 if __name__ == '__main__':
