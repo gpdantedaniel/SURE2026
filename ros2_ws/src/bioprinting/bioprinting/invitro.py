@@ -406,8 +406,8 @@ class InVitroPlanner(Node):
         # req.cartesian_speed_limited_link = self.tool_link
         # req.max_cartesian_speed = float(self.get_parameter("max_speed").value/1000) # Enter in mm/s
 
-        req.pipeline_id = "pilz"
-        req.planner_id = "LIN"
+        req.pipeline = "pilz"
+        req.planner = "LIN"
 
         # Send out the request asynchronously
         self.get_logger().info("Calling cartesian path compute")
