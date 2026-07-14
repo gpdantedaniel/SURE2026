@@ -65,6 +65,12 @@ class InVitroPlanner(Node):
         self.declare_parameter("pose_filename", "")
         self.declare_parameter("target_joint", "")
 
+        # Printing process parameters
+        self.declare_parameter("path_height", 0.0)
+        self.declare_parameter("velocity_scaling_factor", 1.0)
+        self.declare_parameter("acceleration_scaling_factor", 1.0)
+        self.declare_parameter("max_speed", 50.0)
+
         # For computing and executing trajectories
         self.cartesian_client = self.create_client(GetCartesianPath, "/compute_cartesian_path")
         self.execute_client = ActionClient(self, ExecuteTrajectory, "/execute_trajectory")
@@ -279,7 +285,7 @@ class InVitroPlanner(Node):
         # Preprocessing should probably be refined later
         filtered_lines = list(filter(lambda l: l.startswith(accepted_codes), gcode_lines))
         # More deterministic filtering algorithm required - specific to Prusa Slicer
-        filtered_lines = filtered_lines[15:-2]
+        filtered_lines = filtered_lines[16:-2]
 
         # Holds the presently parsed waypoint
         coords = {"x": 0.0, "y": 0.0, "z": 0.0}
@@ -303,8 +309,8 @@ class InVitroPlanner(Node):
                 ]))
 
         waypoints = np.array(waypoints)
-        distance = np.sqrt(waypoints[:, 0]**2 + waypoints[:, 1]**2)
-        waypoints = waypoints - waypoints[0]
+        print("original waypoints")
+        for w in waypoints: print(w)
 
         origin = np.array([[
             current_pose.position.x,
@@ -312,17 +318,14 @@ class InVitroPlanner(Node):
             current_pose.position.z
         ]])
 
-        print('translated waypoints: ')
-        for w in waypoints:
-            print(w)
+        relative_path = waypoints - waypoints[0]
+        print("relative path")
+        for w in relative_path: print(w)
 
-        waypoints = waypoints + origin
-
-        print('origin: ', origin)
-
-        print("waypoints: ")
-        for w in waypoints:
-            print(w)
+        waypoints = origin + relative_path
+        
+        print("adjusted waypoints")
+        for w in waypoints: print(w)
 
         poses = []
 
@@ -396,17 +399,15 @@ class InVitroPlanner(Node):
         req.jump_threshold = 0.0
         req.avoid_collisions = True
 
-        print("gcode file: ", self.get_parameter("gcode_file"))
+        req.max_velocity_scaling_factor = float(self.get_parameter("velocity_scaling_factor").value)
+        req.max_acceleration_scaling_factor = float(self.get_parameter("acceleration_scaling_factor").value)
 
-        if self.get_parameter("gcode_file").value != "":
-            req.max_velocity_scaling_factor = 0.01
-            req.max_acceleration_scaling_factor = 0.01
-        else:
-            req.max_velocity_scaling_factor = 1.0
-            req.max_acceleration_scaling_factor = 1.0
+        # print("Enforcing speed limit at ", self.get_parameter("max_speed").value, "mm/s")
+        # req.cartesian_speed_limited_link = self.tool_link
+        # req.max_cartesian_speed = float(self.get_parameter("max_speed").value/1000) # Enter in mm/s
 
-        req.max_velocity_scaling_factor = 1.0
-        req.max_acceleration_scaling_factor = 1.0
+        req.pipeline_id = "pilz"
+        req.planner_id = "LIN"
 
         # Send out the request asynchronously
         self.get_logger().info("Calling cartesian path compute")
@@ -568,17 +569,15 @@ class InVitroPlanner(Node):
         package_share_dir = get_package_share_directory('bioprinting')
         gcode_path = os.path.join(package_share_dir, gcode_file)
 
-        p1 = self.load_pose("plane_p1")
-
-        waypoints = self.gcode_to_waypoints(gcode_path, p1)
+        origin = self.load_pose("plane_p1")
+        waypoints = self.gcode_to_waypoints(gcode_path, origin)
 
         # EXPERIMENTAL : should be fixed... for some reason sending to infinity... likely how gcode is read
         # waypoints = self.transform_waypoints(waypoints)
 
-        self.get_logger().info("Applying -2 mm offset to all waypoints")
-        for w in waypoints:
-            w.position.z = w.position.z - 0.002
-
+        # Apply offset (formally defined as path_height)
+        path_height = float(self.get_parameter("path_height").value)
+        for w in waypoints: w.position.z = w.position.z + path_height
         
         self.get_logger().info("Computing trajectory...")
         trajectory = self.compute_cartesian_path(waypoints)
