@@ -59,7 +59,7 @@ class InVitroPlanner(Node):
         
         # Instantiate the planning component (Move Group)
         # self.move_group = self.moveit.get_planning_component("panda_arm")
-
+    
         # Declare parameters and defaults
         self.declare_parameter("gcode_file", "")
         self.declare_parameter("pose_filename", "")
@@ -67,9 +67,9 @@ class InVitroPlanner(Node):
 
         # Printing process parameters
         self.declare_parameter("path_height", 0.0)
-        self.declare_parameter("velocity_scaling_factor", 1.0)
-        self.declare_parameter("acceleration_scaling_factor", 1.0)
+        self.declare_parameter("printing_velocity_scaling_factor", 1.0)
         self.declare_parameter("max_speed", 50.0)
+        
 
         # For computing and executing trajectories
         self.cartesian_client = self.create_client(GetCartesianPath, "/compute_cartesian_path")
@@ -126,7 +126,7 @@ class InVitroPlanner(Node):
     def move_relative_to_current(self):
         # Uses hard-coded values just for testing
         current_pose = self.get_current_tcp_pose()
-        self.move_relative(current_pose, 0.0, 0.0, 0.010)
+        self.move_relative_to(current_pose, 0.010, 0.0, 0.0)
     
     # ----- Troubleshooting and manual operations
 
@@ -137,8 +137,8 @@ class InVitroPlanner(Node):
         self.get_logger().info(f"Saving at: {filename}.yaml")
         self.save_pose(current_pose, filename)
         
-    def assume_pose(self):
-        pose_filename = self.get_parameter("pose_filename").value
+    def assume_pose(self, auto_pose=None):
+        pose_filename = auto_pose if auto_pose else self.get_parameter("pose_filename").value
         self.get_logger().info(f"Reading pose at: {pose_filename}.yaml")
 
         pose = self.load_pose(pose_filename)
@@ -309,8 +309,6 @@ class InVitroPlanner(Node):
                 ]))
 
         waypoints = np.array(waypoints)
-        print("original waypoints")
-        for w in waypoints: print(w)
 
         origin = np.array([[
             current_pose.position.x,
@@ -319,14 +317,9 @@ class InVitroPlanner(Node):
         ]])
 
         relative_path = waypoints - waypoints[0]
-        print("relative path")
-        for w in relative_path: print(w)
 
         waypoints = origin + relative_path
-        
-        print("adjusted waypoints")
-        for w in waypoints: print(w)
-
+       
         poses = []
 
         for w in waypoints:
@@ -384,7 +377,7 @@ class InVitroPlanner(Node):
 
         return pose
 
-    def compute_cartesian_path(self, waypoints: list[Pose], callback=None):
+    def compute_cartesian_path(self, waypoints: list[Pose], velocity_sf=1.0):
         """
         Build and send request to /compute_cartesian_path 
         service and return computed trajectory
@@ -399,15 +392,12 @@ class InVitroPlanner(Node):
         req.jump_threshold = 0.0
         req.avoid_collisions = True
 
-        req.max_velocity_scaling_factor = float(self.get_parameter("velocity_scaling_factor").value)
-        req.max_acceleration_scaling_factor = float(self.get_parameter("acceleration_scaling_factor").value)
+        req.max_velocity_scaling_factor = velocity_sf
+        req.max_acceleration_scaling_factor = 1.0
 
         # print("Enforcing speed limit at ", self.get_parameter("max_speed").value, "mm/s")
         # req.cartesian_speed_limited_link = self.tool_link
         # req.max_cartesian_speed = float(self.get_parameter("max_speed").value/1000) # Enter in mm/s
-
-        req.pipeline = "pilz"
-        req.planner = "LIN"
 
         # Send out the request asynchronously
         self.get_logger().info("Calling cartesian path compute")
@@ -429,7 +419,7 @@ class InVitroPlanner(Node):
         
         return result.solution
     
-    def execute_trajectory(self, trajectory: ExecuteTrajectory, callback=None):
+    def execute_trajectory(self, trajectory: ExecuteTrajectory):
         """
         Send out trajectory goal and reports
         acceptance and execution statuses
@@ -441,42 +431,26 @@ class InVitroPlanner(Node):
         self.get_logger().info("Sending out trajectory...")
         send_goal_future = self.execute_client.send_goal_async(goal)
 
-        if callback:
-            
-            def goal_response_cb(future):
-                goal_handle = future.result()
-                if not goal_handle.accepted:
-                    self.get_logger().error("Trajectory execution rejected")
-                    return
-                
-                self.get_logger().info(f"Accepted = {goal_handle.accepted}")
+        rclpy.spin_until_future_complete(self, send_goal_future)
+        self.get_logger().info("Waiting for execution acceptance...")
 
-                result_future = goal_handle.get_result_async()
-                self.get_logger().info("Executing trajectory...")
+        goal_handle = send_goal_future.result()
 
-                result_future.add_done_callback(callback)
-            
-            send_goal_future.add_done_callback(callback=goal_response_cb)
+        if not goal_handle.accepted: raise RuntimeError("Trajectory execution rejected.")
+        else: self.get_logger().info("Trajectory accepted.")
+        
+        self.get_logger().info("Executing trajectory... timing execution!")
+        start_time = time.perf_counter()
 
-        else:
-            rclpy.spin_until_future_complete(self, send_goal_future)
-            self.get_logger().info("Waiting for execution acceptance...")
+        result_future = goal_handle.get_result_async()
+        rclpy.spin_until_future_complete(self, result_future)
+        result = result_future.result()
 
-            goal_handle = send_goal_future.result()
+        end_time = time.perf_counter()
+        self.get_logger().info("Trajectory execution finished.")
+        print(f"Process completed in {(end_time - start_time):.6f} seconds")
 
-            if not goal_handle.accepted:
-                raise RuntimeError("Trajectory execution rejected.")
-            else:
-                self.get_logger().info("Trajectory accepted.")
-
-            self.get_logger().info("Executing trajectory...")
-            result_future = goal_handle.get_result_async()
-            rclpy.spin_until_future_complete(self, result_future)
-
-            result = result_future.result()
-            self.get_logger().info("Trajectory execution finished.")
-
-            return result
+        return result
     
     def orient(self):
         """
@@ -579,17 +553,28 @@ class InVitroPlanner(Node):
         path_height = float(self.get_parameter("path_height").value)
         for w in waypoints: w.position.z = w.position.z + path_height
         
-        self.get_logger().info("Computing trajectory...")
-        trajectory = self.compute_cartesian_path(waypoints)
+        
 
         # EXPERIMENTAL : compensating backlash... should be tuned
         # trajectory = self.compensate_backlash_j5(trajectory)
 
-        self.get_logger().info("Trajectory computed.")
+        # ADD SNIPPET HERE CHATGPT
+        self.get_logger().info("Parking for printing above p1")
+        self.assume_pose(auto_pose="plane_p1")
+
+        self.get_logger().info("Computing trajectory...")
+        printin_vsf = self.get_parameter("printing_velocity_scaling_factor").value
+        printing_trajectory = self.compute_cartesian_path(waypoints, velocity_sf=printin_vsf)
 
         self.get_logger().info("Executing trajectory...")
-        self.execute_trajectory(trajectory)
+        self.execute_trajectory(printing_trajectory)
         self.get_logger().info("Trajectory complete.")
+
+        # ADD SNIPPER HERE CHAT
+        
+        self.get_logger().info("Parking back to purge")
+        self.assume_pose(auto_pose="purge")
+
 
     # ----- New methods for (hopefully functionally) diagnosing backlash
 
@@ -731,6 +716,36 @@ class InVitroPlanner(Node):
         
         return trajectory
 
+    def measure_average_speed(self):
+        """
+        Performs a simple test for a given velocity scaling factor
+        Returns the calculated average velocity
+        """
+
+        # Unnecessary feature for now... hopefully...
+
+        current_pose = self.get_current_tcp_pose()
+        start = time.start()
+        self.move_relative_to()
+        return
+
+    def dance(self):
+        print("I am dancing!")
+        while True:
+            self.assume_pose("dance_pt1")
+            time.sleep(5)
+            self.assume_pose("dance_pt2")
+            time.sleep(5)
+            self.assume_pose("dance_pt3")
+            """
+            time.sleep(5)
+            self.assume_pose("dance_pt1")
+            time.sleep(5)
+            self.assume_pose("sky")
+            time.sleep(5)
+            """
+
+
 commands = {
     "calibrate": lambda node: node.calibrate(),
     "move_relative_to_current": lambda node: node.move_relative_to_current(),
@@ -738,7 +753,8 @@ commands = {
     "orient": lambda node: node.orient(),
     "save_current_pose": lambda node: node.save_current_pose(),
     "park": lambda node: node.assume_pose(),
-    "diagnose_backlash": lambda node: node.diagnose_backlash()
+    "diagnose_backlash": lambda node: node.diagnose_backlash(),
+    "dance": lambda node: node.dance(),
 }
 
 def main():
